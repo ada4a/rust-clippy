@@ -91,17 +91,14 @@ fn main() {
 fn issue15380() {
     #[rustfmt::skip]
     ( {0;0});
-    //~^ semicolon_inside_block
 
     ({
-        //~^ semicolon_inside_block
         0;
         0
     });
 
     #[rustfmt::skip]
     (({0}))    ;
-    //~^ semicolon_inside_block
 }
 
 pub fn issue15388() {
