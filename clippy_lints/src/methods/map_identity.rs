@@ -48,14 +48,6 @@ pub(super) fn check(
             }
         }
 
-        let method_requiring_mut = if let Node::Expr(expr) = cx.tcx.parent_hir_node(expr.hir_id)
-            && let ExprKind::MethodCall(method, ..) = expr.kind
-        {
-            Some(method.ident)
-        } else {
-            None
-        };
-
         span_lint_and_then(
             cx,
             MAP_IDENTITY,
@@ -65,8 +57,10 @@ pub(super) fn check(
                 diag.multipart_suggestion(msg, sugg, app);
 
                 if app != Applicability::MachineApplicable {
-                    let note = if let Some(method_requiring_mut) = method_requiring_mut {
-                        format!("this must be made mutable to use `{method_requiring_mut}`")
+                    let note = if let Node::Expr(expr) = cx.tcx.parent_hir_node(expr.hir_id)
+                        && let ExprKind::MethodCall(method, ..) = expr.kind
+                    {
+                        format!("this must be made mutable to use `{}`", method.ident)
                     } else {
                         "this must be made mutable".to_string()
                     };
