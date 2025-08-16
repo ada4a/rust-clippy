@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::ty::{is_copy, is_type_diagnostic_item};
 use clippy_utils::{is_expr_untyped_identity_function, is_mutable, is_trait_method, path_to_local_with_projections};
 use rustc_errors::Applicability;
 use rustc_hir::{self as hir, ExprKind, Node, PatKind};
@@ -54,7 +54,21 @@ pub(super) fn check(
             call_span,
             "unnecessary map of the identity function",
             |diag| {
-                diag.multipart_suggestion(msg, sugg, app);
+                diag.multipart_suggestion(
+                    msg,
+                    sugg,
+                    if is_copy(cx, caller_ty) {
+                        // there is technically a behavioral change here for `Copy` iterators, where
+                        // `iter.map(|x| x).next()` would mutate a temporary copy of the iterator and
+                        // changing it to `iter.next()` mutates iter directly
+                        //
+                        // NOTE: we don't modify `app` itself, because that would lead to the `if`
+                        // below firing, which we don't want (in the general case)
+                        Applicability::Unspecified
+                    } else {
+                        app
+                    },
+                );
 
                 if app != Applicability::MachineApplicable {
                     let note = if let Node::Expr(expr) = cx.tcx.parent_hir_node(expr.hir_id)
