@@ -59,7 +59,7 @@ declare_clippy_lint! {
 
 pub struct NeedlessBorrowsForGenericArgs<'tcx> {
     /// Stack of (body owner, `PossibleBorrowerMap`) pairs. Used by
-    /// [`needless_borrow_count`] to determine when a borrowed expression can instead
+    /// [`Self::needless_borrow_count`] to determine when a borrowed expression can instead
     /// be moved.
     possible_borrowers: Vec<(LocalDefId, PossibleBorrowerMap<'tcx, 'tcx>)>,
 
@@ -106,16 +106,8 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowsForGenericArgs<'tcx> {
                 },
                 _ => None,
             }
-            && let count = needless_borrow_count(
-                cx,
-                &mut self.possible_borrowers,
-                fn_id,
-                cx.typeck_results().node_args(hir_id),
-                i,
-                param_ty,
-                expr,
-                self.msrv,
-            )
+            && let count =
+                self.needless_borrow_count(cx, fn_id, cx.typeck_results().node_args(hir_id), i, param_ty, expr)
             && count != 0
         {
             span_lint_and_then(
@@ -144,156 +136,157 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowsForGenericArgs<'tcx> {
     }
 }
 
+impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
+    /// Checks for the number of borrow expressions which can be removed from the given expression
+    /// where the expression is used as an argument to a function expecting a generic type.
+    ///
+    /// The following constraints will be checked:
+    /// * The borrowed expression meets all the generic type's constraints.
+    /// * The generic type appears only once in the functions signature.
+    /// * The borrowed value is:
+    ///   - `Copy` itself, or
+    ///   - the only use of a mutable reference, or
+    ///   - not a variable (created by a function call)
+    #[expect(clippy::too_many_lines)]
+    fn needless_borrow_count(
+        &mut self,
+        cx: &LateContext<'tcx>,
+        fn_id: DefId,
+        callee_args: ty::GenericArgsRef<'tcx>,
+        arg_index: usize,
+        param_ty: ParamTy,
+        mut expr: &Expr<'tcx>,
+    ) -> usize {
+        let destruct_trait_def_id = cx.tcx.lang_items().destruct_trait();
+        let sized_trait_def_id = cx.tcx.lang_items().sized_trait();
+        let meta_sized_trait_def_id = cx.tcx.lang_items().meta_sized_trait();
+        let drop_trait_def_id = cx.tcx.lang_items().drop_trait();
+
+        let fn_sig = cx.tcx.fn_sig(fn_id).instantiate_identity().skip_binder();
+        let predicates = cx.tcx.param_env(fn_id).caller_bounds();
+        let projection_predicates = predicates
+            .iter()
+            .filter_map(|predicate| {
+                if let ClauseKind::Projection(projection_predicate) = predicate.kind().skip_binder() {
+                    Some(projection_predicate)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut trait_with_ref_mut_self_method = false;
+
+        // If no traits were found, or only the `Destruct`, `Sized`, or `Any` traits were found, return.
+        if predicates
+            .iter()
+            .filter_map(|predicate| {
+                if let ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
+                    && trait_predicate.trait_ref.self_ty() == param_ty.to_ty(cx.tcx)
+                {
+                    Some(trait_predicate.trait_ref.def_id)
+                } else {
+                    None
+                }
+            })
+            .inspect(|trait_def_id| {
+                trait_with_ref_mut_self_method |= has_ref_mut_self_method(cx, *trait_def_id);
+            })
+            .all(|trait_def_id| {
+                Some(trait_def_id) == destruct_trait_def_id
+                    || Some(trait_def_id) == sized_trait_def_id
+                    || Some(trait_def_id) == meta_sized_trait_def_id
+                    || cx.tcx.is_diagnostic_item(sym::Any, trait_def_id)
+            })
+        {
+            return 0;
+        }
+
+        // See:
+        // - https://github.com/rust-lang/rust-clippy/pull/9674#issuecomment-1289294201
+        // - https://github.com/rust-lang/rust-clippy/pull/9674#issuecomment-1292225232
+        if projection_predicates
+            .iter()
+            .any(|projection_predicate| is_mixed_projection_predicate(cx, fn_id, projection_predicate))
+        {
+            return 0;
+        }
+
+        // `args_with_referent_ty` can be constructed outside of `check_referent` because the same
+        // elements are modified each time `check_referent` is called.
+        let mut args_with_referent_ty = callee_args.to_vec();
+
+        let mut check_reference_and_referent = |reference: &Expr<'tcx>, referent: &Expr<'tcx>| {
+            if let ExprKind::Field(base, _) = &referent.kind
+                && let base_ty = cx.typeck_results().expr_ty(base)
+                && drop_trait_def_id.is_some_and(|id| implements_trait(cx, base_ty, id, &[]))
+            {
+                return false;
+            }
+
+            let referent_ty = cx.typeck_results().expr_ty(referent);
+
+            if !(is_copy(cx, referent_ty)
+                || referent_ty.is_ref() && referent_used_exactly_once(cx, &mut self.possible_borrowers, reference)
+                || matches!(referent.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)))
+            {
+                return false;
+            }
+
+            // https://github.com/rust-lang/rust-clippy/pull/9136#pullrequestreview-1037379321
+            if trait_with_ref_mut_self_method && !matches!(referent_ty.kind(), ty::Ref(_, _, Mutability::Mut)) {
+                return false;
+            }
+
+            if !replace_types(
+                cx,
+                param_ty,
+                referent_ty,
+                fn_sig,
+                arg_index,
+                &projection_predicates,
+                &mut args_with_referent_ty,
+            ) {
+                return false;
+            }
+
+            predicates.iter().all(|predicate| {
+                if let ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
+                    && cx
+                        .tcx
+                        .is_diagnostic_item(sym::IntoIterator, trait_predicate.trait_ref.def_id)
+                    && let ty::Param(param_ty) = trait_predicate.self_ty().kind()
+                    && let GenericArgKind::Type(ty) = args_with_referent_ty[param_ty.index as usize].kind()
+                    && ty.is_array()
+                    && !self.msrv.meets(cx, msrvs::ARRAY_INTO_ITERATOR)
+                {
+                    return false;
+                }
+
+                let predicate = EarlyBinder::bind(predicate).instantiate(cx.tcx, &args_with_referent_ty[..]);
+                let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
+                let infcx = cx.tcx.infer_ctxt().build(cx.typing_mode());
+                infcx.predicate_must_hold_modulo_regions(&obligation)
+            })
+        };
+
+        let mut count = 0;
+        while let ExprKind::AddrOf(_, _, referent) = expr.kind {
+            if !check_reference_and_referent(expr, referent) {
+                break;
+            }
+            expr = referent;
+            count += 1;
+        }
+        count
+    }
+}
+
 fn path_has_args(p: &QPath<'_>) -> bool {
     match *p {
         QPath::Resolved(_, Path { segments: [.., s], .. }) | QPath::TypeRelative(_, s) => s.args.is_some(),
         _ => false,
     }
-}
-
-/// Checks for the number of borrow expressions which can be removed from the given expression
-/// where the expression is used as an argument to a function expecting a generic type.
-///
-/// The following constraints will be checked:
-/// * The borrowed expression meets all the generic type's constraints.
-/// * The generic type appears only once in the functions signature.
-/// * The borrowed value is:
-///   - `Copy` itself, or
-///   - the only use of a mutable reference, or
-///   - not a variable (created by a function call)
-#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
-fn needless_borrow_count<'tcx>(
-    cx: &LateContext<'tcx>,
-    possible_borrowers: &mut Vec<(LocalDefId, PossibleBorrowerMap<'tcx, 'tcx>)>,
-    fn_id: DefId,
-    callee_args: ty::GenericArgsRef<'tcx>,
-    arg_index: usize,
-    param_ty: ParamTy,
-    mut expr: &Expr<'tcx>,
-    msrv: Msrv,
-) -> usize {
-    let destruct_trait_def_id = cx.tcx.lang_items().destruct_trait();
-    let sized_trait_def_id = cx.tcx.lang_items().sized_trait();
-    let meta_sized_trait_def_id = cx.tcx.lang_items().meta_sized_trait();
-    let drop_trait_def_id = cx.tcx.lang_items().drop_trait();
-
-    let fn_sig = cx.tcx.fn_sig(fn_id).instantiate_identity().skip_binder();
-    let predicates = cx.tcx.param_env(fn_id).caller_bounds();
-    let projection_predicates = predicates
-        .iter()
-        .filter_map(|predicate| {
-            if let ClauseKind::Projection(projection_predicate) = predicate.kind().skip_binder() {
-                Some(projection_predicate)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let mut trait_with_ref_mut_self_method = false;
-
-    // If no traits were found, or only the `Destruct`, `Sized`, or `Any` traits were found, return.
-    if predicates
-        .iter()
-        .filter_map(|predicate| {
-            if let ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
-                && trait_predicate.trait_ref.self_ty() == param_ty.to_ty(cx.tcx)
-            {
-                Some(trait_predicate.trait_ref.def_id)
-            } else {
-                None
-            }
-        })
-        .inspect(|trait_def_id| {
-            trait_with_ref_mut_self_method |= has_ref_mut_self_method(cx, *trait_def_id);
-        })
-        .all(|trait_def_id| {
-            Some(trait_def_id) == destruct_trait_def_id
-                || Some(trait_def_id) == sized_trait_def_id
-                || Some(trait_def_id) == meta_sized_trait_def_id
-                || cx.tcx.is_diagnostic_item(sym::Any, trait_def_id)
-        })
-    {
-        return 0;
-    }
-
-    // See:
-    // - https://github.com/rust-lang/rust-clippy/pull/9674#issuecomment-1289294201
-    // - https://github.com/rust-lang/rust-clippy/pull/9674#issuecomment-1292225232
-    if projection_predicates
-        .iter()
-        .any(|projection_predicate| is_mixed_projection_predicate(cx, fn_id, projection_predicate))
-    {
-        return 0;
-    }
-
-    // `args_with_referent_ty` can be constructed outside of `check_referent` because the same
-    // elements are modified each time `check_referent` is called.
-    let mut args_with_referent_ty = callee_args.to_vec();
-
-    let mut check_reference_and_referent = |reference: &Expr<'tcx>, referent: &Expr<'tcx>| {
-        if let ExprKind::Field(base, _) = &referent.kind
-            && let base_ty = cx.typeck_results().expr_ty(base)
-            && drop_trait_def_id.is_some_and(|id| implements_trait(cx, base_ty, id, &[]))
-        {
-            return false;
-        }
-
-        let referent_ty = cx.typeck_results().expr_ty(referent);
-
-        if !(is_copy(cx, referent_ty)
-            || referent_ty.is_ref() && referent_used_exactly_once(cx, possible_borrowers, reference)
-            || matches!(referent.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)))
-        {
-            return false;
-        }
-
-        // https://github.com/rust-lang/rust-clippy/pull/9136#pullrequestreview-1037379321
-        if trait_with_ref_mut_self_method && !matches!(referent_ty.kind(), ty::Ref(_, _, Mutability::Mut)) {
-            return false;
-        }
-
-        if !replace_types(
-            cx,
-            param_ty,
-            referent_ty,
-            fn_sig,
-            arg_index,
-            &projection_predicates,
-            &mut args_with_referent_ty,
-        ) {
-            return false;
-        }
-
-        predicates.iter().all(|predicate| {
-            if let ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
-                && cx
-                    .tcx
-                    .is_diagnostic_item(sym::IntoIterator, trait_predicate.trait_ref.def_id)
-                && let ty::Param(param_ty) = trait_predicate.self_ty().kind()
-                && let GenericArgKind::Type(ty) = args_with_referent_ty[param_ty.index as usize].kind()
-                && ty.is_array()
-                && !msrv.meets(cx, msrvs::ARRAY_INTO_ITERATOR)
-            {
-                return false;
-            }
-
-            let predicate = EarlyBinder::bind(predicate).instantiate(cx.tcx, &args_with_referent_ty[..]);
-            let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
-            let infcx = cx.tcx.infer_ctxt().build(cx.typing_mode());
-            infcx.predicate_must_hold_modulo_regions(&obligation)
-        })
-    };
-
-    let mut count = 0;
-    while let ExprKind::AddrOf(_, _, referent) = expr.kind {
-        if !check_reference_and_referent(expr, referent) {
-            break;
-        }
-        expr = referent;
-        count += 1;
-    }
-    count
 }
 
 fn has_ref_mut_self_method(cx: &LateContext<'_>, trait_def_id: DefId) -> bool {
