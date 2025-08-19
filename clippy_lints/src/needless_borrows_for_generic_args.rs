@@ -14,7 +14,7 @@ use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::{Rvalue, StatementKind};
 use rustc_middle::ty::{
-    self, ClauseKind, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamTy, ProjectionPredicate, Ty,
+    self, ClauseKind, EarlyBinder, FnSig, GenericArg, GenericArgKind, ParamTy, ProjectionPredicate, Ty, TyCtxt,
 };
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::sym;
@@ -58,6 +58,11 @@ declare_clippy_lint! {
 }
 
 pub struct NeedlessBorrowsForGenericArgs<'tcx> {
+    destruct_trait_def_id: Option<DefId>,
+    sized_trait_def_id: Option<DefId>,
+    meta_sized_trait_def_id: Option<DefId>,
+    drop_trait_def_id: Option<DefId>,
+
     /// Stack of (body owner, `PossibleBorrowerMap`) pairs. Used by
     /// [`Self::needless_borrow_count`] to determine when a borrowed expression can instead
     /// be moved.
@@ -68,9 +73,13 @@ pub struct NeedlessBorrowsForGenericArgs<'tcx> {
 }
 impl_lint_pass!(NeedlessBorrowsForGenericArgs<'_> => [NEEDLESS_BORROWS_FOR_GENERIC_ARGS]);
 
-impl NeedlessBorrowsForGenericArgs<'_> {
-    pub fn new(conf: &'static Conf) -> Self {
+impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, conf: &'static Conf) -> Self {
         Self {
+            destruct_trait_def_id: tcx.lang_items().destruct_trait(),
+            sized_trait_def_id: tcx.lang_items().sized_trait(),
+            meta_sized_trait_def_id: tcx.lang_items().meta_sized_trait(),
+            drop_trait_def_id: tcx.lang_items().drop_trait(),
             possible_borrowers: Vec::new(),
             msrv: conf.msrv,
         }
@@ -147,7 +156,6 @@ impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
     ///   - `Copy` itself, or
     ///   - the only use of a mutable reference, or
     ///   - not a variable (created by a function call)
-    #[expect(clippy::too_many_lines)]
     fn needless_borrow_count(
         &mut self,
         cx: &LateContext<'tcx>,
@@ -157,11 +165,6 @@ impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
         param_ty: ParamTy,
         mut expr: &Expr<'tcx>,
     ) -> usize {
-        let destruct_trait_def_id = cx.tcx.lang_items().destruct_trait();
-        let sized_trait_def_id = cx.tcx.lang_items().sized_trait();
-        let meta_sized_trait_def_id = cx.tcx.lang_items().meta_sized_trait();
-        let drop_trait_def_id = cx.tcx.lang_items().drop_trait();
-
         let fn_sig = cx.tcx.fn_sig(fn_id).instantiate_identity().skip_binder();
         let predicates = cx.tcx.param_env(fn_id).caller_bounds();
         let projection_predicates = predicates
@@ -193,9 +196,9 @@ impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
                 trait_with_ref_mut_self_method |= has_ref_mut_self_method(cx, *trait_def_id);
             })
             .all(|trait_def_id| {
-                Some(trait_def_id) == destruct_trait_def_id
-                    || Some(trait_def_id) == sized_trait_def_id
-                    || Some(trait_def_id) == meta_sized_trait_def_id
+                Some(trait_def_id) == self.destruct_trait_def_id
+                    || Some(trait_def_id) == self.sized_trait_def_id
+                    || Some(trait_def_id) == self.meta_sized_trait_def_id
                     || cx.tcx.is_diagnostic_item(sym::Any, trait_def_id)
             })
         {
@@ -219,7 +222,7 @@ impl<'tcx> NeedlessBorrowsForGenericArgs<'tcx> {
         let mut check_reference_and_referent = |reference: &Expr<'tcx>, referent: &Expr<'tcx>| {
             if let ExprKind::Field(base, _) = &referent.kind
                 && let base_ty = cx.typeck_results().expr_ty(base)
-                && drop_trait_def_id.is_some_and(|id| implements_trait(cx, base_ty, id, &[]))
+                && (self.drop_trait_def_id).is_some_and(|id| implements_trait(cx, base_ty, id, &[]))
             {
                 return false;
             }

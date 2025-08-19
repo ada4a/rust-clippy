@@ -781,9 +781,9 @@ pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Co
     store.register_late_pass(|_| Box::new(implied_bounds_in_impls::ImpliedBoundsInImpls));
     store.register_late_pass(|_| Box::new(missing_asserts_for_indexing::MissingAssertsForIndexing));
     store.register_late_pass(|_| Box::new(unnecessary_map_on_constructor::UnnecessaryMapOnConstructor));
-    store.register_late_pass(move |_| {
+    store.register_late_pass(move |tcx| {
         Box::new(needless_borrows_for_generic_args::NeedlessBorrowsForGenericArgs::new(
-            conf,
+            tcx, conf,
         ))
     });
     store.register_late_pass(move |_| Box::new(manual_hash_one::ManualHashOne::new(conf)));
