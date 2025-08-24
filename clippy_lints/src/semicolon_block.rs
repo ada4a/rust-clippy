@@ -1,6 +1,6 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
-use rustc_ast::{Block, Expr, ExprKind, Stmt, StmtKind};
+use rustc_ast::{Block, Expr, ExprKind, HasAttrs as _, Stmt, StmtKind};
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_session::impl_lint_pass;
@@ -155,8 +155,8 @@ impl EarlyLintPass for SemicolonBlock {
                 if let ExprKind::Block(block, _) = &expr.kind
                     && !block.span.from_expansion() =>
             {
-                let attrs = cx.tcx.hir_attrs(stmt.hir_id);
-                if !attrs.is_empty() && !cx.tcx.features().stmt_expr_attributes() {
+                let attrs = stmt.kind.attrs();
+                if !attrs.is_empty() && !cx.builder.features().stmt_expr_attributes() {
                     return;
                 }
 
