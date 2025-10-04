@@ -741,7 +741,7 @@ pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Co
         Box::new(|_| Box::new(unnecessary_owned_empty_strings::UnnecessaryOwnedEmptyStrings)),
         {
             let format_args = format_args_storage.clone();
-            Box::new(move |_| Box::new(format_push_string::FormatPushString::new(format_args.clone())))
+            Box::new(move |tcx| Box::new(format_push_string::FormatPushString::new(tcx, format_args.clone())))
         },
         Box::new(move |_| Box::new(large_include_file::LargeIncludeFile::new(conf))),
         Box::new(|_| Box::new(strings::TrimSplitWhitespace)),

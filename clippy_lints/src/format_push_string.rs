@@ -1,14 +1,16 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::{FormatArgsStorage, format_args_inputs_span, root_macro_call_first_node};
 use clippy_utils::res::MaybeDef;
-use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
+use clippy_utils::source::{snippet_indent, snippet_with_applicability, snippet_with_context};
 use clippy_utils::std_or_core;
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
+use rustc_hir::def_id::{DefId, LocalModDefId};
 use rustc_hir::{AssignOpKind, Expr, ExprKind, LangItem, MatchSource};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_middle::ty::TyCtxt;
 use rustc_session::impl_lint_pass;
 use rustc_span::{Span, sym};
-
 declare_clippy_lint! {
     /// ### What it does
     /// Detects cases where the result of a `format!` call is
@@ -45,6 +47,8 @@ impl_lint_pass!(FormatPushString => [FORMAT_PUSH_STRING]);
 
 pub(crate) struct FormatPushString {
     format_args: FormatArgsStorage,
+    write_trait: Option<DefId>,
+    mods_with_import_added: FxHashSet<LocalModDefId>,
 }
 
 enum FormatSearchResults {
@@ -68,8 +72,12 @@ enum FormatSearchResults {
 }
 
 impl FormatPushString {
-    pub(crate) fn new(format_args: FormatArgsStorage) -> Self {
-        Self { format_args }
+    pub(crate) fn new(tcx: TyCtxt<'_>, format_args: FormatArgsStorage) -> Self {
+        Self {
+            format_args,
+            write_trait: tcx.get_diagnostic_item(sym::FmtWrite),
+            mods_with_import_added: FxHashSet::default(),
+        }
     }
 
     fn find_formats<'tcx>(&self, cx: &LateContext<'_>, e: &'tcx Expr<'tcx>) -> FormatSearchResults {
@@ -139,6 +147,7 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
             // not even `core` is available, so can't suggest `write!`
             return;
         };
+        let msg = "consider using `write!` to avoid the extra allocation";
         match self.find_formats(cx, arg) {
             FormatSearchResults::Direct(format_args) => {
                 span_lint_and_then(
@@ -147,20 +156,54 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
                     expr.span,
                     "`format!(..)` appended to existing `String`",
                     |diag| {
-                        let mut app = Applicability::MaybeIncorrect;
-                        let msg = "consider using `write!` to avoid the extra allocation";
+                        let mut app = Applicability::MachineApplicable;
 
-                        let sugg = format!(
-                            "let _ = write!({recv}, {format_args})",
-                            recv = snippet_with_context(cx.sess(), recv.span, expr.span.ctxt(), "_", &mut app).0,
-                            format_args = snippet_with_applicability(cx.sess(), format_args, "..", &mut app),
+                        let main_sugg = (
+                            expr.span,
+                            format!(
+                                "let _ = write!({recv}, {format_args})",
+                                recv = snippet_with_context(cx.sess(), recv.span, expr.span.ctxt(), "_", &mut app).0,
+                                format_args = snippet_with_applicability(cx.sess(), format_args, "..", &mut app),
+                            ),
                         );
-                        diag.span_suggestion_verbose(expr.span, msg, sugg, app);
 
-                        // TODO: omit the note if the `Write` trait is imported at point
-                        // Tip: `TyCtxt::in_scope_traits` isn't it -- it returns a non-empty list only when called on
-                        // the `HirId` of a `ExprKind::MethodCall` that is a call of a _trait_ method.
-                        diag.note(format!("you may need to import the `{std_or_core}::fmt::Write` trait"));
+                        let is_write_in_scope = if let Some(did) = self.write_trait
+                            && let Some(trait_candidates) = cx.tcx.in_scope_traits(expr.hir_id)
+                            && trait_candidates
+                                .iter()
+                                .any(|trait_candidate| trait_candidate.def_id == did)
+                        {
+                            true
+                        } else {
+                            false
+                        };
+
+                        if is_write_in_scope {
+                            diag.span_suggestion_verbose(main_sugg.0, msg, main_sugg.1, app);
+                        } else {
+                            let body_id = cx.tcx.hir_enclosing_body_owner(expr.hir_id);
+                            let scope = cx.tcx.parent_module_from_def_id(body_id);
+                            let (module, _, _) = cx.tcx.hir_get_module(scope);
+
+                            if self.mods_with_import_added.insert(scope) {
+                                // The trait is not in scope -- we'll need to import it
+                                let import_span = module.spans.inject_use_span;
+                                let import_sugg = (
+                                    import_span,
+                                    format!(
+                                        "use {std_or_core}::fmt::Write as _;\n{indent_of_imports}",
+                                        indent_of_imports =
+                                            snippet_indent(cx.sess(), import_span).as_deref().unwrap_or(""),
+                                    ),
+                                );
+                                let suggs = vec![main_sugg, import_sugg];
+
+                                diag.multipart_suggestion_verbose(msg, suggs, app);
+                            } else {
+                                // Another suggestion will have taken care of importing the trait
+                                diag.span_suggestion_verbose(main_sugg.0, msg, main_sugg.1, app);
+                            }
+                        }
                     },
                 );
             },
@@ -172,14 +215,51 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
                         expr.span,
                         "`format!(..)` appended to existing `String`",
                         |diag| {
-                            diag.help("consider using `write!` to avoid the extra allocation");
-                            diag.span_labels(spans, "`format!` used here");
+                            let main_diag = || {
+                                diag.help("consider using `write!` to avoid the extra allocation");
+                                diag.span_labels(spans, "`format!` used here");
+                            };
 
-                            // TODO: omit the note if the `Write` trait is imported at point
-                            // Tip: `TyCtxt::in_scope_traits` isn't it -- it returns a non-empty list only when called
-                            // on the `HirId` of a `ExprKind::MethodCall` that is a call of
-                            // a _trait_ method.
-                            diag.note(format!("you may need to import the `{std_or_core}::fmt::Write` trait"));
+                            let is_write_in_scope = if let Some(did) = self.write_trait
+                                && let Some(trait_candidates) = cx.tcx.in_scope_traits(expr.hir_id)
+                                && trait_candidates
+                                    .iter()
+                                    .any(|trait_candidate| trait_candidate.def_id == did)
+                            {
+                                true
+                            } else {
+                                false
+                            };
+
+                            if is_write_in_scope {
+                                main_diag();
+                            } else {
+                                let body_id = cx.tcx.hir_enclosing_body_owner(expr.hir_id);
+                                let scope = cx.tcx.parent_module_from_def_id(body_id);
+                                let (module, _, _) = cx.tcx.hir_get_module(scope);
+
+                                if self.mods_with_import_added.insert(scope) {
+                                    // The trait is not in scope -- we'll need to import it
+                                    let import_span = module.spans.inject_use_span;
+                                    let import_sugg = format!(
+                                        "use {std_or_core}::fmt::Write as _;\n{indent_of_imports}",
+                                        indent_of_imports =
+                                            snippet_indent(cx.sess(), import_span).as_deref().unwrap_or(""),
+                                    );
+
+                                    main_diag();
+                                    diag.span_suggestion_verbose(
+                                        import_span,
+                                        msg,
+                                        import_sugg,
+                                        // importing is just a part of the suggestion
+                                        Applicability::MaybeIncorrect,
+                                    );
+                                } else {
+                                    // Another diagnostic will have mentioned the need to import the trait
+                                    main_diag();
+                                }
+                            }
                         },
                     );
                 }
@@ -187,7 +267,6 @@ impl<'tcx> LateLintPass<'tcx> for FormatPushString {
         }
     }
 }
-
 fn is_string(cx: &LateContext<'_>, e: &Expr<'_>) -> bool {
     cx.typeck_results()
         .expr_ty(e)
